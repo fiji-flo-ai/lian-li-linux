@@ -10,7 +10,9 @@ H.264 encoding, which previously tried GPU encoders regardless of the environmen
 The compositor may still use the GPU to render the desktop.
 
 When enabled, the daemon tries available hardware encoders before software H.264.
-Video decoding uses FFmpeg's automatic hardware selection. Drivers and FFmpeg support
+LCD file and live streams request constrained baseline H.264 without B-frames from
+every encoder, matching what the panels receive from L-Connect. An encoder that
+cannot produce it is skipped. Video decoding uses FFmpeg's automatic hardware selection. Drivers and FFmpeg support
 determine what can run; enabling this setting does not guarantee GPU acceleration or
 zero-copy capture. Desktop encoding currently tries NVENC and AMF before libx264.
 

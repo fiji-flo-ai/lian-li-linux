@@ -265,6 +265,20 @@ pub(super) fn finalize_vf(kind: EncoderKind, vf: &str) -> String {
     }
 }
 
+/// The vendor only sends libx264 ultrafast output with B-frames off, which is
+/// constrained baseline. Hardware encoders default to Main or High with CABAC, and an
+/// SL-INF Flex panel stopped accepting USB writes partway through such a stream.
+/// An encoder that cannot produce baseline fails to open and the chain moves on.
+fn panel_profile_args(kind: EncoderKind) -> &'static [&'static str] {
+    match kind {
+        EncoderKind::Nvenc => &["-profile:v", "baseline", "-coder", "cavlc", "-bf", "0"],
+        EncoderKind::Amf => &["-profile:v", "constrained_baseline", "-bf", "0"],
+        EncoderKind::Vaapi | EncoderKind::Vulkan => &["-profile:v", "constrained_baseline"],
+        EncoderKind::Qsv => &["-profile:v", "baseline"],
+        EncoderKind::Libx264 => &[],
+    }
+}
+
 pub(super) fn encoder_codec_args_file(
     kind: EncoderKind,
     fps_str: &str,
@@ -310,6 +324,7 @@ pub(super) fn encoder_codec_args_file(
             args.extend(["-b:v".into(), bitrate_str.into()]);
         }
     }
+    args.extend(panel_profile_args(kind).iter().map(|arg| arg.to_string()));
 
     if !matches!(
         kind,
@@ -367,6 +382,7 @@ pub(super) fn encoder_codec_args_live(
             args.extend(["-b:v".into(), bitrate_str.into()]);
         }
     }
+    args.extend(panel_profile_args(kind).iter().map(|arg| arg.to_string()));
 
     if !matches!(
         kind,
@@ -535,6 +551,67 @@ mod tests {
         assert_eq!(String::from_utf8(inspected.stdout).unwrap().trim(), "10");
         assert_eq!(encoder.name, "libx264");
         assert!(!encoder.software_fallback);
+    }
+
+    #[test]
+    fn software_transcode_is_constrained_baseline_without_b_frames() {
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("frame.png");
+        image::RgbaImage::from_pixel(16, 16, image::Rgba([100, 80, 60, 255]))
+            .save(&input)
+            .unwrap();
+        let (output, _temp, _, _) = encode_h264_with_status(
+            &input,
+            10.0,
+            0.0,
+            &MediaFraming::default(),
+            &ScreenInfo::FLEX_LCD,
+            false,
+        )
+        .unwrap();
+        let probe = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=profile,has_b_frames",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(&output)
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&probe.stdout).trim(),
+            "Constrained Baseline,0"
+        );
+    }
+
+    #[test]
+    fn hardware_encoders_request_baseline_without_b_frames() {
+        for kind in encoder_chain(true)
+            .iter()
+            .filter(|kind| **kind != EncoderKind::Libx264)
+        {
+            for args in [
+                encoder_codec_args_file(*kind, "30", "1000000"),
+                encoder_codec_args_live(*kind, "30", "1000000"),
+            ] {
+                let value = |flag: &str| {
+                    args.windows(2)
+                        .find(|pair| pair[0] == flag)
+                        .map(|pair| pair[1].as_str())
+                };
+                assert!(
+                    matches!(
+                        value("-profile:v"),
+                        Some("baseline" | "constrained_baseline")
+                    ),
+                    "{kind:?}: {args:?}"
+                );
+                assert_eq!(value("-bf"), Some("0"), "{kind:?}: {args:?}");
+            }
+        }
     }
 
     #[test]
