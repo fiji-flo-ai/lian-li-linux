@@ -7,7 +7,7 @@
 //!   - [`base`]      — Lancool 207 (lcd207 `WinUsb`)
 //!   - [`h2_lcd`]    — HydroShift II LCD Circle/Square (lcd207 `WinUsbH2`)
 //!   - [`hs2_oled`]  — HydroShift II OLED Curve (lcd207 `WinUsbHS2`)
-//!   - [`slv3`]      — Universal Screen / Vision / Flex streaming parameters
+//!   - [`slv3`]      — Universal Screen / Vision (lcd207) and TL / SL-INF Flex (slv3 `WinUsb`)
 
 use crate::traits::LcdDevice;
 use anyhow::{bail, Result};
@@ -60,7 +60,7 @@ impl WinUsbLcdDevice {
                 transport,
                 screen,
                 name.to_string(),
-                supports_stop_play(pid),
+                slv3::CommandSet::for_pid(pid),
             )),
         };
         Ok(Self(boxed, pid))
@@ -201,15 +201,10 @@ fn make_device(device: Device<UsbContext>, pid: u16) -> Result<BoxedWinUsbLcd> {
         0xA021 | 0xA034 => h2_lcd::boxed(device, screen, name),
         0xA065 => base::boxed(device, screen, name),
         0xA088 | 0xA092 | 0xA018 | 0xA019 => {
-            slv3::boxed(device, screen, name, supports_stop_play(pid))
+            slv3::boxed(device, screen, name, slv3::CommandSet::for_pid(pid))
         }
         _ => bail!("no WinUSB LCD variant for PID {:#06x}", pid),
     }
-}
-
-fn supports_stop_play(pid: u16) -> bool {
-    // Vendor lcd207 controllers use StopPlay; slv3 Flex only cancels its producer.
-    matches!(pid, 0xA021 | 0xA034 | 0xA065 | 0xA068 | 0xA088 | 0xA092)
 }
 
 /// Driver entry point for the WinUSB LCD family. Dispatches to the correct

@@ -595,6 +595,21 @@ fn buffer_level(response: &[u8]) -> Option<u8> {
     response.get(8).copied()
 }
 
+/// Size of the transparent PNG the vendor sends to clear the Flex animation layer.
+const FLEX_ANIMATION_LAYER_SIZE: u32 = 360;
+
+fn transparent_png(width: u32, height: u32) -> Option<Vec<u8>> {
+    let image = image::RgbaImage::from_pixel(width, height, image::Rgba([0, 0, 0, 0]));
+    let mut png = Vec::new();
+    match image.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png) {
+        Ok(()) => Some(png),
+        Err(e) => {
+            warn!("Failed to encode transparent PNG: {e}");
+            None
+        }
+    }
+}
+
 pub(crate) struct WinUsbLcdCore {
     pub(crate) h264_transferred: Option<Arc<AtomicBool>>,
     transport: SharedTransport,
@@ -1037,19 +1052,13 @@ impl WinUsbLcdCore {
 
     /// Returns whether the PNG layer reached the panel.
     pub(crate) fn clear_layers(&mut self) -> bool {
-        use image::{ImageBuffer, Rgb, Rgba};
-        use std::io::Cursor;
+        use image::{ImageBuffer, Rgb};
 
         let w = self.screen.width;
         let h = self.screen.height;
 
-        let png_img = ImageBuffer::from_pixel(w, h, Rgba([0u8, 0, 0, 0]));
-        let mut png_buf = Vec::new();
         let mut png_sent = false;
-        if png_img
-            .write_to(&mut Cursor::new(&mut png_buf), image::ImageFormat::Png)
-            .is_ok()
-        {
+        if let Some(png_buf) = transparent_png(w, h) {
             let header = self.builder.png_header_winusb(png_buf.len());
             let mut packet = vec![0u8; 512 + png_buf.len()];
             packet[..512].copy_from_slice(&header);
@@ -1084,6 +1093,24 @@ impl WinUsbLcdCore {
             self.read_response("ClearJpgLayer");
         }
         png_sent
+    }
+
+    /// The vendor clears this Flex overlay before applying any content, so an
+    /// overlay left by an earlier session is not drawn over ours.
+    pub(crate) fn clear_flex_animation_layer(&mut self) {
+        let Some(png) = transparent_png(FLEX_ANIMATION_LAYER_SIZE, FLEX_ANIMATION_LAYER_SIZE)
+        else {
+            return;
+        };
+        let header = self.builder.flex_animation_layer_header_winusb(png.len());
+        let mut packet = Vec::with_capacity(header.len() + png.len());
+        packet.extend_from_slice(&header);
+        packet.extend_from_slice(&png);
+        if let Err(e) = self.tx_write_full(&packet) {
+            warn!("ClearAnimationLayer failed: {e}");
+        } else {
+            self.read_response("ClearAnimationLayer");
+        }
     }
 
     pub(crate) fn send_frame(&mut self, frame: &[u8]) -> Result<()> {

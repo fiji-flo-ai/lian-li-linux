@@ -18,6 +18,8 @@ pub const CMD_STOP_CLOCK: u8 = 0x34;
 pub const CMD_PUSH_JPG: u8 = 0x65;
 pub const CMD_PUSH_PNG: u8 = 0x66;
 pub const CMD_CLEAR_PNG: u8 = 0x67;
+/// Flex panels reuse 0x67 for the PNG animation layer drawn above the PNG layer.
+pub const CMD_FLEX_ANIMATION_LAYER: u8 = 0x67;
 pub const CMD_HIDE_SHOW_FRAMES: u8 = 0x68;
 pub const CMD_START_PLAY: u8 = 0x79;
 pub const CMD_QUERY_BLOCK: u8 = 0x7A;
@@ -240,6 +242,11 @@ impl PacketBuilder {
         self.build_winusb(CMD_CLEAR_PNG, &[])
     }
 
+    /// Bytes 12..16 hold the big-endian x and y position, left at the origin.
+    pub fn flex_animation_layer_header_winusb(&mut self, png_size: usize) -> Vec<u8> {
+        self.build_winusb(CMD_FLEX_ANIMATION_LAYER, &(png_size as u32).to_be_bytes())
+    }
+
     pub fn hide_show_frames_none_header_winusb(&mut self) -> Vec<u8> {
         self.build_winusb(CMD_HIDE_SHOW_FRAMES, &[0u8; 32])
     }
@@ -384,6 +391,29 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn flex_animation_layer_header_matches_vendor_push_l3_layout() {
+        use des::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
+        let mut builder = super::PacketBuilder::new();
+        builder.last_timestamp = 100_000;
+        let header = builder.flex_animation_layer_header_winusb(0x0102_0304);
+        assert_eq!(header.len(), 512);
+        assert_eq!(&header[504..], &[0, 0, 0, 0, 0, 0, 0xa1, 0x1a]);
+        let mut encrypted = header[..504].to_vec();
+        let plain = cbc::Decryptor::<des::Des>::new_from_slices(b"slv3tuzx", b"slv3tuzx")
+            .unwrap()
+            .decrypt_padded_mut::<Pkcs7>(&mut encrypted)
+            .unwrap();
+        let mut expected = vec![0; 500];
+        expected[0] = 0x67;
+        expected[2] = 0x1a;
+        expected[3] = 0x6d;
+        expected[4..8].copy_from_slice(&100001u32.to_le_bytes());
+        expected[8..12].copy_from_slice(&[1, 2, 3, 4]);
+        assert_eq!(plain, expected);
+    }
+
     use super::{crc16_ccitt, decrypt_lgbl, is_lgbl};
 
     #[test]
