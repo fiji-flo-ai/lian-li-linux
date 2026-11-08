@@ -1,18 +1,25 @@
-//! Sends a ladder of test frames to a TL or SL-INF Flex LCD and reports whether the
-//! panel acknowledges each one. Stop the daemon first, the panel interface is exclusive.
+//! Sends test frames and a short H.264 clip to a TL or SL-INF Flex LCD and reports
+//! whether the panel acknowledges each one. Stop the daemon first, the panel
+//! interface is exclusive. Steps run in order and stop at the first failure.
 //!
 //! cargo run --release -p lianli-devices --example flex_lcd_probe -- --pid a019
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use clap::Parser;
 use image::{Rgb, RgbImage};
 use lianli_devices::traits::LcdDevice;
 use lianli_devices::winusb::lcd::WinUsbLcdDevice;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
+use turbojpeg::Subsamp;
 
 const SIZE: u32 = 400;
 /// The frame acknowledgement wait is two seconds, so a send this slow had no reply.
 const UNACKNOWLEDGED: Duration = Duration::from_millis(1_900);
+const CLIP_FPS: u32 = 30;
+const CLIP_SECONDS: u32 = 10;
 
 #[derive(Parser)]
 struct Args {
@@ -22,103 +29,47 @@ struct Args {
     /// USB serial of the panel; the first panel found is used when omitted.
     #[arg(long)]
     serial: Option<String>,
-    /// Seconds each frame stays on screen.
+    /// Seconds each step stays on screen.
     #[arg(long, default_value_t = 6)]
     hold: u64,
-    /// Run only this test number.
+    /// Run only this step number.
     #[arg(long)]
     test: Option<usize>,
-    /// Print the tests and their payload sizes without opening a panel.
+    /// Print the steps and their JPEG sizes without opening a panel.
     #[arg(long)]
     list: bool,
 }
 
-enum Encoder {
-    Turbo(turbojpeg::Subsamp),
-    ImageCrate,
-}
-
 #[derive(Clone, Copy)]
-enum Pattern {
-    Solid,
-    Gradient { noise: u8 },
+enum Step {
+    Jpeg {
+        name: &'static str,
+        noise: Option<u8>,
+        subsamp: Subsamp,
+    },
+    H264Clip,
 }
 
-struct Case {
-    name: &'static str,
-    pattern: Pattern,
-    encoder: Encoder,
-    quality: u8,
-    repeat: usize,
-}
-
-fn cases() -> Vec<Case> {
-    use turbojpeg::Subsamp::{None as Sub444, Sub2x2};
-    let case = |name, noise, encoder, quality, repeat| Case {
+fn steps() -> [Step; 7] {
+    let jpeg = |name, noise, subsamp| Step::Jpeg {
         name,
-        pattern: Pattern::Gradient { noise },
-        encoder,
-        quality,
-        repeat,
+        noise,
+        subsamp,
     };
-    vec![
-        Case {
-            name: "solid red, turbojpeg 4:2:0 q95",
-            pattern: Pattern::Solid,
-            encoder: Encoder::Turbo(Sub2x2),
-            quality: 95,
-            repeat: 1,
-        },
-        case(
-            "gradient, turbojpeg 4:2:0 q95",
-            0,
-            Encoder::Turbo(Sub2x2),
-            95,
-            1,
-        ),
-        case("gradient, image crate q95", 0, Encoder::ImageCrate, 95, 1),
-        case(
-            "gradient, turbojpeg 4:4:4 q95",
-            0,
-            Encoder::Turbo(Sub444),
-            95,
-            1,
-        ),
-        case(
-            "gradient, turbojpeg 4:2:0 q95, sent twice",
-            0,
-            Encoder::Turbo(Sub2x2),
-            95,
-            2,
-        ),
-        case(
-            "light noise, turbojpeg 4:2:0 q95",
-            12,
-            Encoder::Turbo(Sub2x2),
-            95,
-            1,
-        ),
-        case(
-            "medium noise, turbojpeg 4:2:0 q95",
-            40,
-            Encoder::Turbo(Sub2x2),
-            95,
-            1,
-        ),
-        case(
-            "heavy noise, turbojpeg 4:2:0 q95",
-            160,
-            Encoder::Turbo(Sub2x2),
-            95,
-            1,
-        ),
+    [
+        jpeg("solid red, 4:4:4", None, Subsamp::None),
+        jpeg("smooth gradient, 4:4:4", Some(0), Subsamp::None),
+        jpeg("lightly grainy gradient, 4:4:4", Some(12), Subsamp::None),
+        jpeg("grainy gradient, 4:4:4", Some(40), Subsamp::None),
+        jpeg("very grainy gradient, 4:4:4", Some(160), Subsamp::None),
+        Step::H264Clip,
+        jpeg("solid red, 4:2:0 (expected to hang)", None, Subsamp::Sub2x2),
     ]
 }
 
-fn render(pattern: Pattern) -> RgbImage {
-    let noise = match pattern {
-        Pattern::Solid => return RgbImage::from_pixel(SIZE, SIZE, Rgb([220, 20, 20])),
-        Pattern::Gradient { noise } => noise,
+fn render(noise: Option<u8>) -> RgbImage {
+    let Some(noise) = noise else {
+        return RgbImage::from_pixel(SIZE, SIZE, Rgb([220, 20, 20]));
     };
     let mut state = 0x2545_f491_u32;
     RgbImage::from_fn(SIZE, SIZE, |x, y| {
@@ -141,26 +92,39 @@ fn render(pattern: Pattern) -> RgbImage {
     })
 }
 
-fn encode(case: &Case) -> Result<Vec<u8>> {
-    let image = render(case.pattern);
-    match case.encoder {
-        Encoder::Turbo(subsamp) => {
-            let source = turbojpeg::Image {
-                pixels: image.as_raw().as_slice(),
-                width: SIZE as usize,
-                pitch: SIZE as usize * 3,
-                height: SIZE as usize,
-                format: turbojpeg::PixelFormat::RGB,
-            };
-            Ok(turbojpeg::compress(source, i32::from(case.quality), subsamp)?.to_vec())
-        }
-        Encoder::ImageCrate => {
-            let mut jpeg = Vec::new();
-            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, case.quality)
-                .encode_image(&image)?;
-            Ok(jpeg)
-        }
-    }
+fn encode_jpeg(noise: Option<u8>, subsamp: Subsamp) -> Result<Vec<u8>> {
+    let image = render(noise);
+    let source = turbojpeg::Image {
+        pixels: image.as_raw().as_slice(),
+        width: SIZE as usize,
+        pitch: SIZE as usize * 3,
+        height: SIZE as usize,
+        format: turbojpeg::PixelFormat::RGB,
+    };
+    Ok(turbojpeg::compress(source, 95, subsamp)?.to_vec())
+}
+
+/// Same libx264 settings the daemon uses for file video.
+fn encode_clip(output: &Path) -> Result<()> {
+    let status = Command::new("ffmpeg")
+        .args(["-y", "-loglevel", "error", "-f", "lavfi", "-i"])
+        .arg(format!("testsrc=size={SIZE}x{SIZE}:rate={CLIP_FPS}"))
+        .args(["-t", &CLIP_SECONDS.to_string(), "-r", &CLIP_FPS.to_string()])
+        .args([
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-x264opts",
+            "bframes=0",
+        ])
+        .args(["-threads", "4", "-pix_fmt", "yuv420p", "-color_range", "pc"])
+        .args(["-an", "-f", "h264"])
+        .arg(output)
+        .status()
+        .context("running ffmpeg")?;
+    ensure!(status.success(), "ffmpeg failed to encode the test clip");
+    Ok(())
 }
 
 fn open_panel(pid: u16, serial: Option<&str>) -> Result<WinUsbLcdDevice> {
@@ -189,50 +153,93 @@ fn open_panel(pid: u16, serial: Option<&str>) -> Result<WinUsbLcdDevice> {
     bail!("no matching 1cbe:{pid:04x} panel found")
 }
 
+/// Returns false when the panel stopped responding.
+fn run(panel: &mut WinUsbLcdDevice, number: usize, step: Step, clip: &Path) -> Result<bool> {
+    match step {
+        Step::Jpeg {
+            name,
+            noise,
+            subsamp,
+        } => {
+            let jpeg = encode_jpeg(noise, subsamp)?;
+            println!(
+                "\nStep {number}: {name} JPEG ({} bytes). Watch the screen.",
+                jpeg.len()
+            );
+            let started = Instant::now();
+            panel.send_frame(&jpeg)?;
+            let elapsed = started.elapsed();
+            println!("  sent in {} ms", elapsed.as_millis());
+            Ok(elapsed < UNACKNOWLEDGED)
+        }
+        Step::H264Clip => {
+            encode_clip(clip)?;
+            println!(
+                "\nStep {number}: {CLIP_SECONDS} s H.264 test pattern with a running counter ({} \
+                 bytes). Watch the screen.",
+                std::fs::metadata(clip)?.len()
+            );
+            let started = Instant::now();
+            let result = panel.stream_h264(clip, false, &AtomicBool::new(false), CLIP_FPS as f32);
+            println!("  streamed in {} ms", started.elapsed().as_millis());
+            match result {
+                Ok(()) => Ok(true),
+                Err(error) => {
+                    println!("  H.264 stream failed: {error:#}");
+                    Ok(false)
+                }
+            }
+        }
+    }
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter("info,lianli_devices=debug")
         .init();
     let args = Args::parse();
     if args.list {
-        for (number, case) in cases().iter().enumerate() {
-            println!(
-                "Test {}: {} ({} bytes)",
-                number + 1,
-                case.name,
-                encode(case)?.len()
-            );
+        for (index, step) in steps().into_iter().enumerate() {
+            match step {
+                Step::Jpeg {
+                    name,
+                    noise,
+                    subsamp,
+                } => println!(
+                    "Step {}: {name} JPEG ({} bytes)",
+                    index + 1,
+                    encode_jpeg(noise, subsamp)?.len()
+                ),
+                Step::H264Clip => println!("Step {}: H.264 test clip", index + 1),
+            }
         }
         return Ok(());
     }
     let pid = u16::from_str_radix(args.pid.trim_start_matches("0x"), 16).context("--pid")?;
     let mut panel = open_panel(pid, args.serial.as_deref())?;
     LcdDevice::initialize(&mut panel).context("initializing the panel")?;
+    let clip: PathBuf =
+        std::env::temp_dir().join(format!("flex-probe-{}.h264", std::process::id()));
 
-    for (number, case) in cases().iter().enumerate().map(|(i, c)| (i + 1, c)) {
+    for (index, step) in steps().into_iter().enumerate() {
+        let number = index + 1;
         if args.test.is_some_and(|only| only != number) {
             continue;
         }
-        let jpeg = encode(case)?;
-        println!(
-            "\nTest {number}: {} ({} bytes). Watch the screen.",
-            case.name,
-            jpeg.len()
-        );
-        for _ in 0..case.repeat {
-            let started = Instant::now();
-            panel.send_frame(&jpeg)?;
-            let elapsed = started.elapsed();
-            println!("  sent in {} ms", elapsed.as_millis());
-            if elapsed >= UNACKNOWLEDGED {
-                println!(
-                    "  The panel did not acknowledge this frame. Stopping; power-cycle the fans \
-                     before running another test."
-                );
-                return Ok(());
-            }
+        let responding = run(&mut panel, number, step, &clip);
+        let _ = std::fs::remove_file(&clip);
+        if !responding? {
+            println!(
+                "  The panel stopped responding. Stopping here; power-cycle the fans before \
+                 running another step."
+            );
+            return Ok(());
         }
-        std::thread::sleep(Duration::from_secs(args.hold));
+        let playback = match step {
+            Step::H264Clip => u64::from(CLIP_SECONDS),
+            Step::Jpeg { .. } => 0,
+        };
+        std::thread::sleep(Duration::from_secs(args.hold + playback));
     }
     Ok(())
 }
