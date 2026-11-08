@@ -1,6 +1,9 @@
 use super::playback::{LcdTransferInterrupted, PlaybackState};
 use super::ring::{RingDelivery, RingKey};
-use crate::crypto::PacketBuilder;
+use crate::crypto::{
+    PacketBuilder, CMD_BRIGHTNESS, CMD_FLEX_ANIMATION_LAYER, CMD_FRAME_RATE, CMD_GET_H264_BLOCK,
+    CMD_GET_VER, CMD_LCD_REVISION, CMD_PUSH_JPG, CMD_PUSH_PNG, CMD_QUERY_BLOCK, CMD_START_PLAY,
+};
 use anyhow::{bail, Context, Result};
 use lianli_shared::screen::ScreenInfo;
 use lianli_transport::usb::{RusbBulk, EP_IN, EP_OUT};
@@ -200,9 +203,11 @@ impl LcdLink {
                 "Startup image transfer incomplete. Storage state is unknown"
             );
             let mut reply = [0; 512];
-            let response_received = bulk
-                .read(&mut reply, Duration::from_secs(1))
-                .is_ok_and(|length| length > 0);
+            let response_received =
+                read_matching_reply(&mut reply, None, Duration::from_secs(1), |buf, timeout| {
+                    bulk.read(buf, timeout)
+                })
+                .is_ok_and(|reply| reply.is_some());
             self.storage_interrupted.store(false, Ordering::Release);
             Ok(response_received)
         })
@@ -219,11 +224,13 @@ impl LcdLink {
             "Short LCD revision probe write"
         );
         let mut reply = [0; 512];
-        let length = match bulk.read(&mut reply, Duration::from_millis(10)) {
-            Ok(length) => length,
-            Err(lianli_transport::TransportError::Usb(rusb::Error::Timeout)) => 0,
-            Err(error) => return Err(error.into()),
-        };
+        let length = read_matching_reply(
+            &mut reply,
+            Some(CMD_LCD_REVISION),
+            REVISION_REPLY_WAIT,
+            |buf, timeout| bulk.read(buf, timeout),
+        )?
+        .unwrap_or_default();
         Ok(crate::startup_image::revision(&reply[..length]).unwrap_or(false))
     }
 
@@ -559,6 +566,9 @@ const REOPEN_DELAY: Duration = Duration::from_millis(100);
 const WAKE_STEP: Duration = Duration::from_millis(150);
 /// Reply wait for the wake commands inside a push and recover cycle.
 const WAKE_REPLY_WAIT: Duration = Duration::from_millis(100);
+/// The vendor checks for the revision reply after 20 ms, but a Flex panel can send
+/// an empty packet first and answer a little later.
+const REVISION_REPLY_WAIT: Duration = Duration::from_millis(200);
 /// Whole push, reopen and GetVer cycle, which holds the bulk lock throughout.
 /// Measured 4.3 s to 8.3 s on a Circle.
 const RING_TRANSACTION_BUDGET: Duration = Duration::from_secs(10);
@@ -597,6 +607,38 @@ fn buffer_level(response: &[u8]) -> Option<u8> {
 
 /// Size of the transparent PNG the vendor sends to clear the Flex animation layer.
 const FLEX_ANIMATION_LAYER_SIZE: u32 = 360;
+/// Bounds how many empty or stale packets one Flex reply wait may consume.
+const FLEX_REPLY_MAX_PACKETS: usize = 16;
+
+/// Flex panels send a zero-length packet ahead of most replies and answer slow
+/// commands only after processing them, so the first packet read after a command
+/// is often empty or belongs to the previous command. A reply counts once its first
+/// byte echoes the expected command; `None` accepts any non-empty reply.
+fn read_matching_reply(
+    buf: &mut [u8; 512],
+    command: Option<u8>,
+    timeout: Duration,
+    mut read: impl FnMut(&mut [u8], Duration) -> Result<usize, lianli_transport::TransportError>,
+) -> Result<Option<usize>, lianli_transport::TransportError> {
+    use lianli_transport::TransportError;
+    let deadline = Instant::now() + timeout;
+    for _ in 0..FLEX_REPLY_MAX_PACKETS {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match read(&mut buf[..], remaining) {
+            Ok(0) => {}
+            Ok(length) if command.is_none_or(|command| buf[0] == command) => {
+                return Ok(Some(length));
+            }
+            Ok(length) => debug!("Skipping LCD reply {:#04x} ({length} bytes)", buf[0]),
+            Err(TransportError::Timeout | TransportError::Usb(rusb::Error::Timeout)) => break,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(None)
+}
 
 fn transparent_png(width: u32, height: u32) -> Option<Vec<u8>> {
     let image = image::RgbaImage::from_pixel(width, height, image::Rgba([0, 0, 0, 0]));
@@ -628,6 +670,7 @@ pub(crate) struct WinUsbLcdCore {
     playback: PlaybackState,
     stop_play_supported: bool,
     resend_stalled_chunk: bool,
+    matched_replies: bool,
     last_chunk_resend: Option<Instant>,
 }
 
@@ -715,6 +758,7 @@ impl WinUsbLcdCore {
             playback: PlaybackState::default(),
             stop_play_supported,
             resend_stalled_chunk: true,
+            matched_replies: false,
             last_chunk_resend: None,
         })
     }
@@ -743,6 +787,7 @@ impl WinUsbLcdCore {
             playback: PlaybackState::default(),
             stop_play_supported,
             resend_stalled_chunk: true,
+            matched_replies: false,
             last_chunk_resend: None,
         }
     }
@@ -751,6 +796,11 @@ impl WinUsbLcdCore {
     /// AIO message queue before replaying, so a bare resend is not equivalent.
     pub(crate) fn without_stalled_chunk_resend(mut self) -> Self {
         self.resend_stalled_chunk = false;
+        self
+    }
+
+    pub(crate) fn with_matched_replies(mut self) -> Self {
+        self.matched_replies = true;
         self
     }
 
@@ -911,6 +961,38 @@ impl WinUsbLcdCore {
         None
     }
 
+    fn read_reply(&mut self, command: u8, context: &str) -> Option<LcdResponse> {
+        if !self.matched_replies {
+            return self.read_response(context);
+        }
+        let mut buf = [0u8; 512];
+        let bulk = self.transport.lock();
+        let result = read_matching_reply(
+            &mut buf,
+            Some(command),
+            self.read_timeout,
+            |buf, timeout| bulk.read(buf, timeout),
+        );
+        drop(bulk);
+        match result {
+            Ok(Some(length)) => {
+                debug!(
+                    "Response for {context} ({length} bytes): {:02x?}",
+                    &buf[..length.min(32)]
+                );
+                Some(LcdResponse { bytes: buf, length })
+            }
+            Ok(None) => {
+                debug!("No response for {context} (timeout)");
+                None
+            }
+            Err(e) => {
+                warn!("Read after {context} failed: {e}");
+                None
+            }
+        }
+    }
+
     pub(crate) fn send_command(&mut self, header: Vec<u8>, label: &str) {
         match self.tx_write_full(&header) {
             Ok(_) => self.note_write_success(),
@@ -964,7 +1046,7 @@ impl WinUsbLcdCore {
             Ok(_) => self.note_write_success(),
             Err(e) => warn!("GetVer write failed: {e}"),
         }
-        if let Some(resp) = self.read_response("GetVer") {
+        if let Some(resp) = self.read_reply(CMD_GET_VER, "GetVer") {
             let fw_bytes = resp.get(8..40.min(resp.len())).unwrap_or_default();
             let end = fw_bytes
                 .iter()
@@ -987,7 +1069,18 @@ impl WinUsbLcdCore {
             return;
         }
         let mut response = [0u8; 512];
-        match bulk.read(&mut response, self.read_timeout) {
+        let read = if self.matched_replies {
+            read_matching_reply(
+                &mut response,
+                Some(CMD_GET_H264_BLOCK),
+                self.read_timeout,
+                |buf, timeout| bulk.read(buf, timeout),
+            )
+            .map(Option::unwrap_or_default)
+        } else {
+            bulk.read(&mut response, self.read_timeout)
+        };
+        match read {
             Ok(length) => match transport.h264_chunk_size.update(&response[..length]) {
                 Some(size) => debug!("H264 chunk size from device: {size}"),
                 None if response.get(8..12) == Some(&[0, 0, 0, 0]) && length >= 12 => {
@@ -1066,7 +1159,7 @@ impl WinUsbLcdCore {
             if let Err(e) = self.tx_write_full(&packet) {
                 warn!("ClearPngLayer failed: {e}");
             } else {
-                self.read_response("ClearPngLayer");
+                self.read_reply(CMD_PUSH_PNG, "ClearPngLayer");
                 png_sent = true;
             }
         }
@@ -1090,7 +1183,7 @@ impl WinUsbLcdCore {
         if let Err(e) = self.tx_write_full(&packet) {
             warn!("ClearJpgLayer failed: {e}");
         } else {
-            self.read_response("ClearJpgLayer");
+            self.read_reply(CMD_PUSH_JPG, "ClearJpgLayer");
         }
         png_sent
     }
@@ -1109,7 +1202,7 @@ impl WinUsbLcdCore {
         if let Err(e) = self.tx_write_full(&packet) {
             warn!("ClearAnimationLayer failed: {e}");
         } else {
-            self.read_response("ClearAnimationLayer");
+            self.read_reply(CMD_FLEX_ANIMATION_LAYER, "ClearAnimationLayer");
         }
     }
 
@@ -1123,10 +1216,10 @@ impl WinUsbLcdCore {
             );
         }
 
-        let header = if self.screen.png {
-            self.builder.png_header_winusb(frame.len())
+        let (header, command) = if self.screen.png {
+            (self.builder.png_header_winusb(frame.len()), CMD_PUSH_PNG)
         } else {
-            self.builder.jpeg_header_winusb(frame.len())
+            (self.builder.jpeg_header_winusb(frame.len()), CMD_PUSH_JPG)
         };
         let total = 512 + frame.len();
         let mut packet = vec![0u8; total];
@@ -1145,7 +1238,7 @@ impl WinUsbLcdCore {
             }
         }
 
-        let resp = self.read_response("frame ack");
+        let resp = self.read_reply(command, "frame ack");
         if let Some(level) = resp.as_deref().and_then(buffer_level) {
             if level > 3 {
                 self.wait_buffer(2, None);
@@ -1174,7 +1267,7 @@ impl WinUsbLcdCore {
     pub(crate) fn set_brightness_val(&mut self, brightness: u8) -> Result<()> {
         let header = self.builder.brightness_header_winusb(brightness);
         self.tx_write_full(&header).context("setting brightness")?;
-        self.read_response("brightness");
+        self.read_reply(CMD_BRIGHTNESS, "brightness");
         debug!("Set brightness to {}", brightness.min(100));
         Ok(())
     }
@@ -1182,7 +1275,7 @@ impl WinUsbLcdCore {
     pub(crate) fn set_frame_rate(&mut self, fps: u8) -> Result<()> {
         let header = self.builder.frame_rate_header_winusb(fps);
         self.tx_write_full(&header).context("setting frame rate")?;
-        self.read_response("frame rate");
+        self.read_reply(CMD_FRAME_RATE, "frame rate");
         debug!("Set frame rate to {fps}");
         Ok(())
     }
@@ -1208,6 +1301,12 @@ impl WinUsbLcdCore {
     fn query_buffer_level(&mut self) -> Option<u8> {
         let header = self.builder.query_buffer_level_header_winusb();
         self.tx_write_full(&header).ok()?;
+        if self.matched_replies {
+            return self
+                .read_reply(CMD_QUERY_BLOCK, "QueryBlock")
+                .as_deref()
+                .and_then(buffer_level);
+        }
         let mut buf = [0u8; 512];
         match self.tx_read(&mut buf) {
             Ok(n) if n > 0 => {
@@ -1430,7 +1529,7 @@ impl WinUsbLcdCore {
         }
         self.note_write_success();
 
-        let resp = self.read_response("h264 chunk");
+        let resp = self.read_reply(CMD_START_PLAY, "h264 chunk");
         if let Some(transferred) = &self.h264_transferred {
             transferred.store(true, Ordering::Release);
         }
@@ -1896,6 +1995,83 @@ mod file_stream_tests {
         assert!(
             read_stream_chunk(&mut Cursor::new(Vec::<u8>::new()), &mut [0; 2], true, 0).is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod flex_reply_tests {
+    use super::{read_matching_reply, FLEX_REPLY_MAX_PACKETS};
+    use lianli_transport::TransportError;
+    use std::collections::VecDeque;
+    use std::time::Duration;
+
+    /// Each entry is the first byte of a 512-byte reply, or `None` for a zero-length packet.
+    fn replay(
+        packets: &[Option<u8>],
+        end: TransportError,
+    ) -> (Result<Option<usize>, TransportError>, u8, usize) {
+        let mut queue: VecDeque<Option<u8>> = packets.iter().copied().collect();
+        let mut end = Some(end);
+        let mut reads = 0;
+        let mut buf = [0u8; 512];
+        let result = read_matching_reply(&mut buf, Some(0x65), Duration::from_secs(2), |buf, _| {
+            reads += 1;
+            match queue.pop_front() {
+                Some(None) => Ok(0),
+                Some(Some(command)) => {
+                    buf[0] = command;
+                    Ok(512)
+                }
+                None => Err(end.take().unwrap_or(TransportError::Timeout)),
+            }
+        });
+        (result, buf[0], reads)
+    }
+
+    #[test]
+    fn late_reply_after_empty_packet_and_stale_reply_is_matched() {
+        let (result, command, reads) = replay(
+            &[None, Some(0x66), Some(0x65)],
+            TransportError::Usb(rusb::Error::Timeout),
+        );
+        assert_eq!(result.unwrap(), Some(512));
+        assert_eq!(command, 0x65);
+        assert_eq!(reads, 3);
+    }
+
+    #[test]
+    fn missing_reply_times_out_and_endless_empty_packets_stay_bounded() {
+        let (result, _, _) = replay(
+            &[None, Some(0x66)],
+            TransportError::Usb(rusb::Error::Timeout),
+        );
+        assert_eq!(result.unwrap(), None);
+
+        let (result, _, reads) = replay(
+            &[None; FLEX_REPLY_MAX_PACKETS + 8],
+            TransportError::Usb(rusb::Error::Timeout),
+        );
+        assert_eq!(result.unwrap(), None);
+        assert_eq!(reads, FLEX_REPLY_MAX_PACKETS);
+    }
+
+    #[test]
+    fn transport_failures_other_than_timeouts_propagate() {
+        let (result, _, _) = replay(&[None], TransportError::Usb(rusb::Error::NoDevice));
+        assert!(matches!(
+            result,
+            Err(TransportError::Usb(rusb::Error::NoDevice))
+        ));
+    }
+
+    #[test]
+    fn any_reply_is_accepted_when_no_command_is_expected() {
+        let mut buf = [0u8; 512];
+        let mut packets = VecDeque::from([0usize, 7]);
+        let result = read_matching_reply(&mut buf, None, Duration::from_secs(1), |_, _| {
+            Ok(packets.pop_front().unwrap())
+        });
+        assert_eq!(result.unwrap(), Some(7));
     }
 }
 

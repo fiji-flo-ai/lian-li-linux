@@ -29,6 +29,13 @@ impl CommandSet {
     fn stop_play_supported(self) -> bool {
         self == Self::Lcd207
     }
+
+    fn configure(self, core: WinUsbLcdCore) -> WinUsbLcdCore {
+        match self {
+            Self::Lcd207 => core,
+            Self::Flex => core.with_matched_replies(),
+        }
+    }
 }
 
 pub struct Slv3WinUsbLcd {
@@ -51,7 +58,10 @@ impl Slv3WinUsbLcd {
             READ_TIMEOUT,
             commands.stop_play_supported(),
         )?;
-        Ok(Self { core, commands })
+        Ok(Self {
+            core: commands.configure(core),
+            commands,
+        })
     }
 
     pub(crate) fn from_shared(
@@ -61,14 +71,14 @@ impl Slv3WinUsbLcd {
         commands: CommandSet,
     ) -> Self {
         Self {
-            core: WinUsbLcdCore::from_shared(
+            core: commands.configure(WinUsbLcdCore::from_shared(
                 transport,
                 screen,
                 name,
                 WRITE_TIMEOUT,
                 READ_TIMEOUT,
                 commands.stop_play_supported(),
-            ),
+            )),
             commands,
         }
     }

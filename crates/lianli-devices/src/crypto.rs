@@ -24,6 +24,7 @@ pub const CMD_HIDE_SHOW_FRAMES: u8 = 0x68;
 pub const CMD_START_PLAY: u8 = 0x79;
 pub const CMD_QUERY_BLOCK: u8 = 0x7A;
 pub const CMD_STOP_PLAY: u8 = 0x7B;
+pub const CMD_LCD_REVISION: u8 = 0x80;
 pub const CMD_REBOOT: u8 = 0x0B;
 pub const CMD_SWITCH_TO_DESKTOP: u8 = 0x96;
 pub const CMD_WARN_SWITCH: u8 = 0x2E;
@@ -144,7 +145,7 @@ impl PacketBuilder {
     }
 
     pub fn lcd_revision_header(&mut self) -> Vec<u8> {
-        self.build_winusb(0x80, &[])
+        self.build_winusb(CMD_LCD_REVISION, &[])
     }
 
     /// Build a brightness control header (cmd 0x0E, value 0-100).
